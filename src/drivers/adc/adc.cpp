@@ -37,7 +37,7 @@
  * Driver for an ADC.
  *
  */
-
+#include <stdint.h>
 #include <drivers/drv_adc.h>
 #include <drivers/drv_hrt.h>
 #include <lib/cdev/CDev.hpp>
@@ -64,27 +64,22 @@ class ADC : public cdev::CDev, public px4::ScheduledWorkItem
 {
 public:
 	ADC(uint32_t base_address, uint32_t channels);
-	~ADC();
+	~ADC() override;
 
-	virtual int		init();
+	int		init() override;
 
-	virtual int		ioctl(file *filp, int cmd, unsigned long arg);
-	virtual ssize_t		read(file *filp, char *buffer, size_t len);
-
-protected:
-	virtual int		open_first(struct file *filp);
-	virtual int		close_last(struct file *filp);
+	ssize_t		read(file *filp, char *buffer, size_t len) override;
 
 private:
-	void			Run() override;
+	void		Run() override;
 
 	/**
 	 * Sample a single channel and return the measured value.
 	 *
 	 * @param channel		The channel to sample.
-	 * @return			The sampled value, or 0xffff if sampling failed.
+	 * @return			The sampled value, or UINT32_MAX if sampling failed.
 	 */
-	uint16_t		sample(unsigned channel);
+	uint32_t		sample(unsigned channel);
 
 	void			update_adc_report(hrt_abstime now);
 	void			update_system_power(hrt_abstime now);
@@ -105,7 +100,7 @@ private:
 ADC::ADC(uint32_t base_address, uint32_t channels) :
 	CDev(ADC0_DEVICE_PATH),
 	ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::hp_default),
-	_sample_perf(perf_alloc(PC_ELAPSED, "adc_samples")),
+	_sample_perf(perf_alloc(PC_ELAPSED, MODULE_NAME": sample")),
 	_base_address(base_address)
 {
 	/* always enable the temperature sensor */
@@ -140,6 +135,8 @@ ADC::ADC(uint32_t base_address, uint32_t channels) :
 
 ADC::~ADC()
 {
+	ScheduleClear();
+
 	if (_samples != nullptr) {
 		delete _samples;
 	}
@@ -151,21 +148,25 @@ ADC::~ADC()
 int
 ADC::init()
 {
-	int rv = px4_arch_adc_init(_base_address);
+	int ret_init = px4_arch_adc_init(_base_address);
 
-	if (rv < 0) {
-		PX4_DEBUG("sample timeout");
-		return rv;
+	if (ret_init < 0) {
+		PX4_ERR("arch adc init failed");
+		return ret_init;
 	}
 
 	/* create the device node */
-	return CDev::init();
-}
+	int ret_cdev = CDev::init();
 
-int
-ADC::ioctl(file *filp, int cmd, unsigned long arg)
-{
-	return -ENOTTY;
+	if (ret_cdev != PX4_OK) {
+		PX4_ERR("CDev init failed");
+		return ret_cdev;
+	}
+
+	// schedule regular updates
+	ScheduleOnInterval(kINTERVAL, kINTERVAL);
+
+	return PX4_OK;
 }
 
 ssize_t
@@ -183,26 +184,6 @@ ADC::read(file *filp, char *buffer, size_t len)
 	px4_leave_critical_section(flags);
 
 	return len;
-}
-
-int
-ADC::open_first(struct file *filp)
-{
-	/* get fresh data */
-	Run();
-
-	/* and schedule regular updates */
-	ScheduleOnInterval(kINTERVAL, kINTERVAL);
-
-	return 0;
-}
-
-int
-ADC::close_last(struct file *filp)
-{
-	ScheduleClear();
-
-	return 0;
 }
 
 void
@@ -233,7 +214,8 @@ ADC::update_adc_report(hrt_abstime now)
 
 	for (unsigned i = 0; i < max_num; i++) {
 		adc.channel_id[i] = _samples[i].am_channel;
-		adc.channel_value[i] = _samples[i].am_data * 3.3f / 4096.0f;
+		adc.channel_value[i] = _samples[i].am_data * 3.3f / px4_arch_adc_dn_fullcount();
+		;
 	}
 
 	_to_adc_report.publish(adc);
@@ -258,7 +240,7 @@ ADC::update_system_power(hrt_abstime now)
 
 		if (_samples[i].am_channel == ADC_SCALED_V5_SENSE) {
 			// it is 2:1 scaled
-			system_power.voltage5v_v = _samples[i].am_data * (ADC_V5_V_FULL_SCALE / 4096.0f);
+			system_power.voltage5v_v = _samples[i].am_data * (ADC_V5_V_FULL_SCALE / px4_arch_adc_dn_fullcount());
 			cnt--;
 
 		} else
@@ -267,7 +249,7 @@ ADC::update_system_power(hrt_abstime now)
 		{
 			if (_samples[i].am_channel == ADC_SCALED_V3V3_SENSORS_SENSE) {
 				// it is 2:1 scaled
-				system_power.voltage3v3_v = _samples[i].am_data * (ADC_3V3_SCALE * (3.3f / 4096.0f));
+				system_power.voltage3v3_v = _samples[i].am_data * (ADC_3V3_SCALE * (3.3f / px4_arch_adc_dn_fullcount()));
 				system_power.v3v3_valid = 1;
 				cnt--;
 			}
@@ -323,13 +305,13 @@ ADC::update_system_power(hrt_abstime now)
 #endif // BOARD_ADC_USB_CONNECTED
 }
 
-uint16_t
+uint32_t
 ADC::sample(unsigned channel)
 {
 	perf_begin(_sample_perf);
-	uint16_t result = px4_arch_adc_sample(_base_address, channel);
+	uint32_t result = px4_arch_adc_sample(_base_address, channel);
 
-	if (result == 0xffff) {
+	if (result == UINT32_MAX) {
 		PX4_ERR("sample timeout");
 	}
 

@@ -47,6 +47,7 @@
 #include <drivers/drv_tone_alarm.h>
 #include <ecl/geo/geo.h>
 #include <systemlib/px4_macros.h>
+#include <math.h>
 
 #ifdef CONFIG_NET
 #include <net/if.h>
@@ -188,6 +189,10 @@ MavlinkReceiver::handle_message(mavlink_message_t *msg)
 
 	case MAVLINK_MSG_ID_LANDING_TARGET:
 		handle_message_landing_target(msg);
+		break;
+
+	case MAVLINK_MSG_ID_CELLULAR_STATUS:
+		handle_message_cellular_status(msg);
 		break;
 
 	case MAVLINK_MSG_ID_ADSB_VEHICLE:
@@ -449,7 +454,6 @@ void MavlinkReceiver::handle_message_command_both(mavlink_message_t *msg, const 
 		const vehicle_command_s &vehicle_command)
 {
 	bool target_ok = evaluate_target_ok(cmd_mavlink.command, cmd_mavlink.target_system, cmd_mavlink.target_component);
-
 	bool send_ack = true;
 	uint8_t result = vehicle_command_ack_s::VEHICLE_RESULT_ACCEPTED;
 
@@ -470,19 +474,37 @@ void MavlinkReceiver::handle_message_command_both(mavlink_message_t *msg, const 
 		_mavlink->configure_stream_threadsafe("HOME_POSITION", 0.5f);
 
 	} else if (cmd_mavlink.command == MAV_CMD_SET_MESSAGE_INTERVAL) {
-		if (set_message_interval((int)(cmd_mavlink.param1 + 0.5f), cmd_mavlink.param2, cmd_mavlink.param3)) {
+		if (set_message_interval((int)roundf(cmd_mavlink.param1), cmd_mavlink.param2, cmd_mavlink.param3)) {
 			result = vehicle_command_ack_s::VEHICLE_RESULT_FAILED;
 		}
 
 	} else if (cmd_mavlink.command == MAV_CMD_GET_MESSAGE_INTERVAL) {
-		get_message_interval((int)cmd_mavlink.param1);
+		get_message_interval((int)roundf(cmd_mavlink.param1));
 
 	} else if (cmd_mavlink.command == MAV_CMD_REQUEST_FLIGHT_INFORMATION) {
 		send_flight_information();
 
 	} else if (cmd_mavlink.command == MAV_CMD_REQUEST_STORAGE_INFORMATION) {
-		if ((int)(cmd_mavlink.param2 + 0.5f) == 1) {
-			send_storage_information(cmd_mavlink.param1 + 0.5f);
+		if ((int)roundf(cmd_mavlink.param1) == 1) {
+			send_storage_information((int)roundf(cmd_mavlink.param1));
+		}
+
+	} else if (cmd_mavlink.command == MAV_CMD_REQUEST_MESSAGE) {
+		uint16_t message_id = (uint16_t)roundf(cmd_mavlink.param1);
+		bool stream_found = false;
+
+		for (const auto &stream : _mavlink->get_streams()) {
+			if (stream->get_id() == message_id) {
+				stream->request_message(vehicle_command.param1, vehicle_command.param2, vehicle_command.param3,
+							vehicle_command.param4, vehicle_command.param5, vehicle_command.param6, vehicle_command.param7);
+				stream_found = true;
+				break;
+			}
+		}
+
+		// TODO: Handle the case where a message is requested which could be sent, but for which there is no stream.
+		if (!stream_found) {
+			result = vehicle_command_ack_s::VEHICLE_RESULT_DENIED;
 		}
 
 	} else {
@@ -696,7 +718,7 @@ MavlinkReceiver::handle_message_distance_sensor(mavlink_message_t *msg)
 	ds.q[3]             = dist_sensor.quaternion[3];
 	ds.signal_quality   = -1; // TODO: A dist_sensor.signal_quality field is missing from the mavlink message definition.
 	ds.type             = dist_sensor.type;
-	ds.id               = MAV_DISTANCE_SENSOR_LASER;
+	ds.id               = dist_sensor.id;
 	ds.orientation      = dist_sensor.orientation;
 
 	_distance_sensor_pub.publish(ds);
@@ -1593,8 +1615,8 @@ MavlinkReceiver::handle_message_ping(mavlink_message_t *msg)
 void
 MavlinkReceiver::handle_message_battery_status(mavlink_message_t *msg)
 {
-	if (msg->sysid != mavlink_system.sysid) {
-		// ignore battery status of other system
+	if ((msg->sysid != mavlink_system.sysid) || (msg->compid == mavlink_system.compid)) {
+		// ignore battery status coming from other systems or from the autopilot itself
 		return;
 	}
 
@@ -2195,6 +2217,26 @@ MavlinkReceiver::handle_message_landing_target(mavlink_message_t *msg)
 }
 
 void
+MavlinkReceiver::handle_message_cellular_status(mavlink_message_t *msg)
+{
+	mavlink_cellular_status_t status;
+	mavlink_msg_cellular_status_decode(msg, &status);
+
+	cellular_status_s cellular_status{};
+
+	cellular_status.timestamp = hrt_absolute_time();
+	cellular_status.status = status.status;
+	cellular_status.type = status.type;
+	cellular_status.quality = status.quality;
+	cellular_status.mcc = status.mcc;
+	cellular_status.mnc = status.mnc;
+	cellular_status.lac = status.lac;
+	cellular_status.cid = status.cid;
+
+	_cellular_status_pub.publish(cellular_status);
+}
+
+void
 MavlinkReceiver::handle_message_adsb_vehicle(mavlink_message_t *msg)
 {
 	mavlink_adsb_vehicle_t adsb;
@@ -2592,30 +2634,7 @@ void MavlinkReceiver::handle_message_statustext(mavlink_message_t *msg)
 
 		log_message_s log_message{};
 
-		switch (statustext.severity) {
-		case MAV_SEVERITY_EMERGENCY:
-		case MAV_SEVERITY_ALERT:
-		case MAV_SEVERITY_CRITICAL:
-			log_message.severity = 0;
-			break;
-
-		case MAV_SEVERITY_ERROR:
-			log_message.severity = 3;
-			break;
-
-		case MAV_SEVERITY_WARNING:
-			log_message.severity = 4;
-			break;
-
-		case MAV_SEVERITY_NOTICE:
-		case MAV_SEVERITY_INFO:
-			log_message.severity = 6;
-			break;
-
-		default:
-			return;
-		}
-
+		log_message.severity = statustext.severity;
 		log_message.timestamp = hrt_absolute_time();
 
 		snprintf(log_message.text, sizeof(log_message.text),
@@ -2698,18 +2717,8 @@ MavlinkReceiver::Run()
 
 		if (poll(&fds[0], 1, timeout) > 0) {
 			if (_mavlink->get_protocol() == Protocol::SERIAL) {
-
-				/*
-				 * to avoid reading very small chunks wait for data before reading
-				 * this is designed to target one message, so >20 bytes at a time
-				 */
-				const unsigned character_count = 20;
-
 				/* non-blocking read. read may return negative values */
-				if ((nread = ::read(fds[0].fd, buf, sizeof(buf))) < (ssize_t)character_count) {
-					const unsigned sleeptime = character_count * 1000000 / (_mavlink->get_baudrate() / 10);
-					px4_usleep(sleeptime);
-				}
+				nread = ::read(fds[0].fd, buf, sizeof(buf));
 			}
 
 #if defined(MAVLINK_UDP)
