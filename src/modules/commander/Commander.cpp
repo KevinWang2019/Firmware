@@ -50,7 +50,6 @@
 #include "Arming/HealthFlags/HealthFlags.h"
 #include "accelerometer_calibration.h"
 #include "airspeed_calibration.h"
-#include "baro_calibration.h"
 #include "calibration_routines.h"
 #include "commander_helper.h"
 #include "esc_calibration.h"
@@ -81,7 +80,6 @@
 #include <cstring>
 
 #include <uORB/topics/mavlink_log.h>
-#include <uORB/topics/mission.h>
 
 typedef enum VEHICLE_MODE_FLAG {
 	VEHICLE_MODE_FLAG_CUSTOM_MODE_ENABLED = 1, /* 0b00000001 Reserved for future use. | */
@@ -158,6 +156,7 @@ static int power_button_state_notification_cb(board_power_button_state_notificat
 	return ret;
 }
 
+#ifndef CONSTRAINED_FLASH
 static bool send_vehicle_command(uint16_t cmd, float param1 = NAN, float param2 = NAN, float param3 = NAN,
 				 float param4 = NAN, float param5 = NAN, float param6 = NAN, float param7 = NAN)
 {
@@ -185,6 +184,7 @@ static bool send_vehicle_command(uint16_t cmd, float param1 = NAN, float param2 
 
 	return vcmd_pub.publish(vcmd);
 }
+#endif
 
 extern "C" __EXPORT int commander_main(int argc, char *argv[])
 {
@@ -248,6 +248,8 @@ extern "C" __EXPORT int commander_main(int argc, char *argv[])
 		return 0;
 	}
 
+#ifndef CONSTRAINED_FLASH
+
 	if (!strcmp(argv[1], "calibrate")) {
 		if (argc > 2) {
 			if (!strcmp(argv[2], "gyro")) {
@@ -287,12 +289,14 @@ extern "C" __EXPORT int commander_main(int argc, char *argv[])
 	}
 
 	if (!strcmp(argv[1], "check")) {
-		bool preflight_check_res = PreFlightCheck::preflightCheck(nullptr, status, status_flags, true, true, false, 30_s);
+		bool preflight_check_res = PreFlightCheck::preflightCheck(nullptr, status, status_flags, true, true, true, 30_s);
 		PX4_INFO("Preflight check: %s", preflight_check_res ? "OK" : "FAILED");
 
 		bool prearm_check_res = PreFlightCheck::preArmCheck(nullptr, status_flags, safety_s{},
 					PreFlightCheck::arm_requirements_t{}, status);
 		PX4_INFO("Prearm check: %s", prearm_check_res ? "OK" : "FAILED");
+
+		print_health_flags(status);
 
 		return 0;
 	}
@@ -410,6 +414,8 @@ extern "C" __EXPORT int commander_main(int argc, char *argv[])
 
 		return (ret ? 0 : 1);
 	}
+
+#endif
 
 	Commander::print_usage("unrecognized command");
 	return 1;
@@ -692,13 +698,16 @@ Commander::handle_command(vehicle_status_s *status_local, const vehicle_command_
 						break;
 					}
 
-					// Flick to inair restore first if this comes from an onboard system
-					if (cmd.source_system == status_local->system_id && cmd.source_component == status_local->component_id) {
+					const bool cmd_from_io = (static_cast<int>(roundf(cmd.param3)) == 1234);
+
+					// Flick to inair restore first if this comes from an onboard system and from IO
+					if (cmd.source_system == status_local->system_id && cmd.source_component == status_local->component_id
+					    && cmd_from_io && cmd_arms) {
 						status.arming_state = vehicle_status_s::ARMING_STATE_IN_AIR_RESTORE;
 
 					} else {
 						// Refuse to arm if preflight checks have failed
-						if ((!status_local->hil_state) != vehicle_status_s::HIL_STATE_ON
+						if (status_local->hil_state != vehicle_status_s::HIL_STATE_ON
 						    && !status_flags.condition_system_sensors_initialized) {
 							mavlink_log_critical(&mavlink_log_pub, "Arming denied! Preflight checks have failed");
 							cmd_result = vehicle_command_s::VEHICLE_CMD_RESULT_DENIED;
@@ -749,23 +758,33 @@ Commander::handle_command(vehicle_status_s *status_local, const vehicle_command_
 
 	case vehicle_command_s::VEHICLE_CMD_DO_FLIGHTTERMINATION: {
 			if (cmd.param1 > 1.5f) {
-				armed_local->lockdown = true;
-				warnx("forcing lockdown (motors off)");
+				if (!_lockdown_triggered) {
+					armed_local->lockdown = true;
+					_lockdown_triggered = true;
+					PX4_WARN("forcing lockdown (motors off)");
+				}
 
 			} else if (cmd.param1 > 0.5f) {
 				//XXX update state machine?
-				armed_local->force_failsafe = true;
-				warnx("forcing failsafe (termination)");
+				if (!_flight_termination_triggered) {
+					armed_local->force_failsafe = true;
+					_flight_termination_triggered = true;
+					PX4_WARN("forcing failsafe (termination)");
+				}
 
 				if ((int)cmd.param2 <= 0) {
 					/* reset all commanded failure modes */
-					warnx("reset all non-flighttermination failsafe commands");
+					PX4_WARN("reset all non-flighttermination failsafe commands");
 				}
 
 			} else {
 				armed_local->force_failsafe = false;
 				armed_local->lockdown = false;
-				warnx("disabling failsafe and lockdown");
+
+				_lockdown_triggered = false;
+				_flight_termination_triggered = false;
+
+				PX4_WARN("disabling failsafe and lockdown");
 			}
 
 			cmd_result = vehicle_command_s::VEHICLE_CMD_RESULT_ACCEPTED;
@@ -1039,6 +1058,7 @@ Commander::handle_command(vehicle_status_s *status_local, const vehicle_command_
 	case vehicle_command_s::VEHICLE_CMD_DO_SET_CAM_TRIGG_DIST:
 	case vehicle_command_s::VEHICLE_CMD_DO_SET_CAM_TRIGG_INTERVAL:
 	case vehicle_command_s::VEHICLE_CMD_SET_CAMERA_MODE:
+	case vehicle_command_s::VEHICLE_CMD_SET_CAMERA_ZOOM:
 	case vehicle_command_s::VEHICLE_CMD_DO_CHANGE_SPEED:
 	case vehicle_command_s::VEHICLE_CMD_DO_LAND_START:
 	case vehicle_command_s::VEHICLE_CMD_DO_GO_AROUND:
@@ -1192,17 +1212,12 @@ Commander::run()
 {
 	bool sensor_fail_tune_played = false;
 
-	param_t _param_airmode = param_find("MC_AIRMODE");
-	param_t _param_rc_map_arm_switch = param_find("RC_MAP_ARM_SW");
+	const param_t param_airmode = param_find("MC_AIRMODE");
+	const param_t param_rc_map_arm_switch = param_find("RC_MAP_ARM_SW");
 
 	/* initialize */
-	if (led_init() != OK) {
-		PX4_WARN("LED init failed");
-	}
-
-	if (buzzer_init() != OK) {
-		PX4_WARN("Buzzer init failed");
-	}
+	led_init();
+	buzzer_init();
 
 	{
 		// we need to do an initial publication to make sure uORB allocates the buffer, which cannot happen
@@ -1221,9 +1236,6 @@ Commander::run()
 
 
 	get_circuit_breaker_params();
-
-	/* command ack */
-
 
 	/* init mission state, do it here to allow navigator to use stored mission even if mavlink failed to start */
 	mission_init();
@@ -1289,7 +1301,7 @@ Commander::run()
 	arm_auth_init(&mavlink_log_pub, &status.system_id);
 
 	// run preflight immediately to find all relevant parameters, but don't report
-	PreFlightCheck::preflightCheck(&mavlink_log_pub, status, status_flags, _arm_requirements.global_position, false, false,
+	PreFlightCheck::preflightCheck(&mavlink_log_pub, status, status_flags, _arm_requirements.global_position, false, true,
 				       hrt_elapsed_time(&_boot_timestamp));
 
 	while (!should_exit()) {
@@ -1306,6 +1318,20 @@ Commander::run()
 
 			// update parameters from storage
 			updateParams();
+
+			// NAV_DLL_ACT value 4 Data Link Auto Recovery (CASA Outback Challenge rules) deleted 2020-03-10
+			if (_param_nav_dll_act.get() == 4) {
+				mavlink_log_critical(&mavlink_log_pub, "CASA Outback Challenge rules (NAV_DLL_ACT = 4) retired");
+				_param_nav_dll_act.set(2); // value 2 Return mode
+				_param_nav_dll_act.commit_no_notification();
+			}
+
+			// NAV_RCL_ACT value 4 RC Auto Recovery (CASA Outback Challenge rules) deleted 2020-03-10
+			if (_param_nav_rcl_act.get() == 4) {
+				mavlink_log_critical(&mavlink_log_pub, "CASA Outback Challenge rules (NAV_RCL_ACT = 4) retired");
+				_param_nav_rcl_act.set(2); // value 2 Return mode
+				_param_nav_rcl_act.commit_no_notification();
+			}
 
 			/* update parameters */
 			if (!armed.armed) {
@@ -1364,16 +1390,18 @@ Commander::run()
 			_auto_disarm_killed.set_hysteresis_time_from(false, _param_com_kill_disarm.get() * 1_s);
 
 			/* check for unsafe Airmode settings: yaw airmode requires the use of an arming switch */
-			if (_param_airmode != PARAM_INVALID && _param_rc_map_arm_switch != PARAM_INVALID) {
-				param_get(_param_airmode, &airmode);
-				param_get(_param_rc_map_arm_switch, &rc_map_arm_switch);
+			if (param_airmode != PARAM_INVALID && param_rc_map_arm_switch != PARAM_INVALID) {
+				param_get(param_airmode, &airmode);
+				param_get(param_rc_map_arm_switch, &rc_map_arm_switch);
 
 				if (airmode == 2 && rc_map_arm_switch == 0) {
 					airmode = 1; // change to roll/pitch airmode
-					param_set(_param_airmode, &airmode);
+					param_set(param_airmode, &airmode);
 					mavlink_log_critical(&mavlink_log_pub, "Yaw Airmode requires the use of an Arm Switch")
 				}
 			}
+
+			_offboard_available.set_hysteresis_time_from(true, _param_com_of_loss_t.get());
 
 			param_init_forced = false;
 		}
@@ -1414,10 +1442,14 @@ Commander::run()
 				/* if the USB hardware connection went away, reboot */
 				if (status_flags.usb_connected && !system_power.usb_connected && shutdown_if_allowed()) {
 					/*
-					 * apparently the USB cable went away but we are still powered,
-					 * so lets reset to a classic non-usb state.
+					 * Apparently the USB cable went away but we are still powered,
+					 * so we bring the system back to a nominal state for flight.
+					 * This is important to unload the USB stack of the OS which is
+					 * a relatively complex piece of software that is non-essential
+					 * for flight and continuing to run it would add a software risk
+					 * without a need. The clean approach to unload it is to reboot.
 					 */
-					mavlink_log_critical(&mavlink_log_pub, "USB disconnected, rebooting.")
+					mavlink_log_critical(&mavlink_log_pub, "USB disconnected, rebooting for flight safety")
 					px4_usleep(400000);
 					px4_shutdown_request(true, false);
 				}
@@ -1429,16 +1461,25 @@ Commander::run()
 			const bool previous_safety_off = _safety.safety_off;
 
 			if (_safety_sub.copy(&_safety)) {
+				// disarm if safety is now on and still armed
+				if (armed.armed && _safety.safety_switch_available && !_safety.safety_off) {
 
-				/* disarm if safety is now on and still armed */
-				if (armed.armed && (status.hil_state == vehicle_status_s::HIL_STATE_OFF)
-				    && _safety.safety_switch_available && !_safety.safety_off) {
+					bool safety_disarm_allowed = (status.hil_state == vehicle_status_s::HIL_STATE_OFF);
 
-					if (TRANSITION_CHANGED == arming_state_transition(&status, _safety, vehicle_status_s::ARMING_STATE_STANDBY,
-							&armed, true /* fRunPreArmChecks */, &mavlink_log_pub,
-							&status_flags, _arm_requirements, hrt_elapsed_time(&_boot_timestamp))
-					   ) {
-						_status_changed = true;
+					// if land detector is available then prevent disarming via safety button if not landed
+					if (hrt_elapsed_time(&_land_detector.timestamp) < 1_s) {
+
+						bool maybe_landing = (_land_detector.landed || _land_detector.maybe_landed);
+
+						if (!maybe_landing) {
+							safety_disarm_allowed = false;
+						}
+					}
+
+					if (safety_disarm_allowed) {
+						if (TRANSITION_CHANGED == arm_disarm(false, true, &mavlink_log_pub, "Safety button")) {
+							_status_changed = true;
+						}
 					}
 				}
 
@@ -1515,6 +1556,8 @@ Commander::run()
 
 		/* Update land detector */
 		if (_land_detector_sub.updated()) {
+			_was_landed = _land_detector.landed;
+			bool was_falling = _land_detector.freefall;
 			_land_detector_sub.copy(&_land_detector);
 
 			// Only take actions if armed
@@ -1536,15 +1579,12 @@ Commander::run()
 					}
 				}
 
-				if (_was_falling != _land_detector.freefall) {
+				if (was_falling != _land_detector.freefall) {
 					if (_land_detector.freefall) {
 						mavlink_and_console_log_info(&mavlink_log_pub, "Freefall detected");
 					}
 				}
 			}
-
-			_was_landed = _land_detector.landed;
-			_was_falling = _land_detector.freefall;
 		}
 
 
@@ -1660,13 +1700,14 @@ Commander::run()
 		/* start geofence result check */
 		_geofence_result_sub.update(&_geofence_result);
 
+		const bool in_low_battery_failsafe = _battery_warning > battery_status_s::BATTERY_WARNING_LOW;
+
 		// Geofence actions
 		const bool geofence_action_enabled = _geofence_result.geofence_action != geofence_result_s::GF_ACTION_NONE;
-		const bool not_in_battery_failsafe = _battery_warning < battery_status_s::BATTERY_WARNING_CRITICAL;
 
 		if (armed.armed
 		    && geofence_action_enabled
-		    && not_in_battery_failsafe) {
+		    && !in_low_battery_failsafe) {
 
 			// check for geofence violation transition
 			if (_geofence_result.geofence_violated && !_geofence_violated_prev) {
@@ -1701,7 +1742,7 @@ Commander::run()
 					}
 
 				case (geofence_result_s::GF_ACTION_TERMINATE) : {
-						warnx("Flight termination because of geofence");
+						PX4_WARN("Flight termination because of geofence");
 						mavlink_log_critical(&mavlink_log_pub, "Geofence violation! Flight terminated");
 						armed.force_failsafe = true;
 						_status_changed = true;
@@ -1741,17 +1782,24 @@ Commander::run()
 
 		// abort auto mode or geofence reaction if sticks are moved significantly
 		// but only if not in a low battery handling action
-		const bool low_battery_reaction = _battery_warning < battery_status_s::BATTERY_WARNING_CRITICAL;
 		const bool is_rotary_wing = status.vehicle_type == vehicle_status_s::VEHICLE_TYPE_ROTARY_WING;
-		const bool in_auto_mode =
-			_internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_LAND ||
-			_internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_RTL ||
-			_internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_MISSION ||
-			_internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_LOITER;
 
-		if (_param_rc_override.get() && is_rotary_wing && !low_battery_reaction
-		    && !_geofence_warning_action_on && in_auto_mode) {
+		const bool override_auto_mode =
+			(_param_rc_override.get() & OVERRIDE_AUTO_MODE_BIT) &&
+			(_internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_TAKEOFF ||
+			 _internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_LAND    ||
+			 _internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_RTL 	  ||
+			 _internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_MISSION ||
+			 _internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_LOITER ||
+			 _internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_FOLLOW_TARGET ||
+			 _internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_PRECLAND);
 
+		const bool override_offboard_mode =
+			(_param_rc_override.get() & OVERRIDE_OFFBOARD_MODE_BIT) &&
+			_internal_state.main_state == commander_state_s::MAIN_STATE_OFFBOARD;
+
+		if ((override_auto_mode || override_offboard_mode) && is_rotary_wing
+		    && !in_low_battery_failsafe && !_geofence_warning_action_on) {
 			// transition to previous state if sticks are touched
 			if ((_last_sp_man.timestamp != _sp_man.timestamp) &&
 			    ((fabsf(_sp_man.x - _last_sp_man.x) > _min_stick_change) ||
@@ -1761,7 +1809,7 @@ Commander::run()
 
 				// revert to position control in any case
 				main_state_transition(status, commander_state_s::MAIN_STATE_POSCTL, status_flags, &_internal_state);
-				mavlink_log_critical(&mavlink_log_pub, "Autonomy off! Returned control to pilot");
+				mavlink_log_info(&mavlink_log_pub, "Pilot took over control using sticks");
 			}
 		}
 
@@ -1965,6 +2013,8 @@ Commander::run()
 		// data link checks which update the status
 		data_link_check();
 
+		avoidance_check();
+
 		// engine failure detection
 		// TODO: move out of commander
 		if (_actuator_controls_sub.updated()) {
@@ -2066,19 +2116,29 @@ Commander::run()
 		}
 
 		if (armed.armed &&
-		    failure_detector_updated &&
-		    !_flight_termination_triggered &&
-		    !status_flags.circuit_breaker_flight_termination_disabled) {
+		    failure_detector_updated) {
 
 			if (_failure_detector.isFailure()) {
+				if ((hrt_elapsed_time(&_time_at_takeoff) < 3_s) &&
+				    !_lockdown_triggered) {
+					// This handles the case where something fails during the early takeoff phase
 
-				armed.force_failsafe = true;
-				_status_changed = true;
+					armed.lockdown = true;
+					_lockdown_triggered = true;
+					_status_changed = true;
 
-				_flight_termination_triggered = true;
+					mavlink_log_emergency(&mavlink_log_pub, "Critical failure detected: lockdown");
 
-				mavlink_log_critical(&mavlink_log_pub, "Critical failure detected: terminate flight");
-				set_tune_override(TONE_PARACHUTE_RELEASE_TUNE);
+				} else if (!status_flags.circuit_breaker_flight_termination_disabled &&
+					   !_flight_termination_triggered) {
+
+					armed.force_failsafe = true;
+					_flight_termination_triggered = true;
+					_status_changed = true;
+
+					mavlink_log_emergency(&mavlink_log_pub, "Critical failure detected: terminate flight");
+					set_tune_override(TONE_PARACHUTE_RELEASE_TUNE);
+				}
 			}
 		}
 
@@ -2089,15 +2149,15 @@ Commander::run()
 		if (!_home_pub.get().manual_home) {
 			const vehicle_local_position_s &local_position = _local_position_sub.get();
 
-			if (armed.armed) {
-				if ((!_was_armed || (_was_landed && !_land_detector.landed)) &&
-				    (hrt_elapsed_time(&_boot_timestamp) > INAIR_RESTART_HOLDOFF_INTERVAL)) {
+			// set the home position when taking off, but only if we were previously disarmed
+			// and at least 500 ms from commander start spent to avoid setting home on in-air restart
+			if (_should_set_home_on_takeoff && _was_landed && !_land_detector.landed &&
+			    (hrt_elapsed_time(&_boot_timestamp) > INAIR_RESTART_HOLDOFF_INTERVAL)) {
+				_should_set_home_on_takeoff = false;
+				set_home_position();
+			}
 
-					/* update home position on arming if at least 500 ms from commander start spent to avoid setting home on in-air restart */
-					set_home_position();
-				}
-
-			} else {
+			if (!armed.armed) {
 				if (status_flags.condition_home_position_valid) {
 					if (_land_detector.landed && local_position.xy_valid && local_position.z_valid) {
 						/* distance from home */
@@ -2132,13 +2192,25 @@ Commander::run()
 		if (_was_armed != armed.armed) {
 			_status_changed = true;
 
-			if (!armed.armed) { // increase the flight uuid upon disarming
+			if (armed.armed) {
+				if (!_land_detector.landed) { // check if takeoff already detected upon arming
+					_have_taken_off_since_arming = true;
+				}
+
+			} else { // increase the flight uuid upon disarming
 				const int32_t flight_uuid = _param_flight_uuid.get() + 1;
 				_param_flight_uuid.set(flight_uuid);
 				_param_flight_uuid.commit_no_notification();
 
 				_last_disarmed_timestamp = hrt_absolute_time();
+
+				_should_set_home_on_takeoff = true;
 			}
+		}
+
+		if (!armed.armed) {
+			/* Reset the flag if disarmed. */
+			_have_taken_off_since_arming = false;
 		}
 
 		_was_armed = armed.armed;
@@ -2223,6 +2295,16 @@ Commander::run()
 
 			/* publish vehicle_status_flags */
 			status_flags.timestamp = hrt_absolute_time();
+
+			// Evaluate current prearm status
+			if (!armed.armed) {
+				bool preflight_check_res = PreFlightCheck::preflightCheck(nullptr, status, status_flags, true, false, true, 30_s);
+				bool prearm_check_res = PreFlightCheck::preArmCheck(nullptr, status_flags, _safety,
+							_arm_requirements, status, false);
+				set_health_flags(subsystem_info_s::SUBSYSTEM_TYPE_PREARM_CHECK, true, true, (preflight_check_res
+						 && prearm_check_res), status);
+			}
+
 			_vehicle_status_flags_pub.publish(status_flags);
 		}
 
@@ -2292,11 +2374,6 @@ Commander::run()
 
 		_status_changed = false;
 
-		if (!armed.armed) {
-			/* Reset the flag if disarmed. */
-			_have_taken_off_since_arming = false;
-		}
-
 		arm_auth_update(now, params_updated || param_init_forced);
 
 		px4_usleep(COMMANDER_MONITORING_INTERVAL);
@@ -2331,12 +2408,12 @@ Commander::get_circuit_breaker_params()
 			CBRK_AIRSPD_CHK_KEY);
 	status_flags.circuit_breaker_engaged_enginefailure_check = circuit_breaker_enabled_by_val(_param_cbrk_enginefail.get(),
 			CBRK_ENGINEFAIL_KEY);
-	status_flags.circuit_breaker_engaged_gpsfailure_check = circuit_breaker_enabled_by_val(_param_cbrk_gpsfail.get(),
-			CBRK_GPSFAIL_KEY);
 	status_flags.circuit_breaker_flight_termination_disabled = circuit_breaker_enabled_by_val(_param_cbrk_flightterm.get(),
 			CBRK_FLIGHTTERM_KEY);
 	status_flags.circuit_breaker_engaged_posfailure_check = circuit_breaker_enabled_by_val(_param_cbrk_velposerr.get(),
 			CBRK_VELPOSERR_KEY);
+	status_flags.circuit_breaker_vtol_fw_arming_check = circuit_breaker_enabled_by_val(_param_cbrk_vtolarming.get(),
+			CBRK_VTOLARMING_KEY);
 }
 
 void
@@ -2622,7 +2699,7 @@ Commander::set_main_state_rc(const vehicle_status_s &status_local, bool *changed
 	if (_sp_man.mode_slot != manual_control_setpoint_s::MODE_SLOT_NONE) {
 
 		if (_sp_man.mode_slot > manual_control_setpoint_s::MODE_SLOT_NUM) {
-			warnx("m slot overflow");
+			PX4_WARN("m slot overflow");
 			return TRANSITION_DENIED;
 		}
 
@@ -3029,13 +3106,11 @@ Commander::update_control_mode()
 		break;
 
 	case vehicle_status_s::NAVIGATION_STATE_AUTO_RTL:
-	case vehicle_status_s::NAVIGATION_STATE_AUTO_RCRECOVER:
 		/* override is not ok for the RTL and recovery mode */
 		control_mode.flag_external_manual_override_ok = false;
 
 	/* fallthrough */
 	case vehicle_status_s::NAVIGATION_STATE_AUTO_FOLLOW_TARGET:
-	case vehicle_status_s::NAVIGATION_STATE_AUTO_RTGS:
 	case vehicle_status_s::NAVIGATION_STATE_AUTO_LAND:
 	case vehicle_status_s::NAVIGATION_STATE_AUTO_LANDENGFAIL:
 	case vehicle_status_s::NAVIGATION_STATE_AUTO_PRECLAND:
@@ -3352,7 +3427,7 @@ void *commander_low_prio_loop(void *arg)
 						tune_positive(true);
 
 						// time since boot not relevant here
-						if (PreFlightCheck::preflightCheck(&mavlink_log_pub, status, status_flags, false, false, false, 30_s)) {
+						if (PreFlightCheck::preflightCheck(&mavlink_log_pub, status, status_flags, false, false, true, 30_s)) {
 
 							status_flags.condition_system_sensors_initialized = true;
 						}
@@ -3496,7 +3571,7 @@ void Commander::enable_hil()
 void Commander::mission_init()
 {
 	/* init mission state, do it here to allow navigator to use stored mission even if mavlink failed to start */
-	mission_s mission{};
+	mission_s mission;
 
 	if (dm_read(DM_KEY_MISSION_STATE, 0, &mission, sizeof(mission_s)) == sizeof(mission_s)) {
 		if (mission.dataman_id == DM_KEY_WAYPOINTS_OFFBOARD_0 || mission.dataman_id == DM_KEY_WAYPOINTS_OFFBOARD_1) {
@@ -3513,8 +3588,7 @@ void Commander::mission_init()
 			dm_write(DM_KEY_MISSION_STATE, 0, DM_PERSIST_POWER_ON_RESET, &mission, sizeof(mission_s));
 		}
 
-		uORB::Publication<mission_s> mission_pub{ORB_ID(mission)};
-		mission_pub.publish(mission);
+		_mission_pub.publish(mission);
 	}
 }
 
@@ -3556,11 +3630,17 @@ void Commander::data_link_check()
 			switch (telemetry.remote_type) {
 			case telemetry_status_s::MAV_TYPE_GCS:
 
-				// Recover from data link lost
+				// Initial connection or recovery from data link lost
 				if (status.data_link_lost) {
 					if (telemetry.heartbeat_time > _datalink_last_heartbeat_gcs) {
 						status.data_link_lost = false;
 						_status_changed = true;
+
+						if (!armed.armed && !status_flags.condition_calibration_enabled) {
+							// make sure to report preflight check failures to a connecting GCS
+							PreFlightCheck::preflightCheck(&mavlink_log_pub, status, status_flags,
+										       _arm_requirements.global_position, true, true, hrt_elapsed_time(&_boot_timestamp));
+						}
 
 						if (_datalink_last_heartbeat_gcs != 0) {
 							mavlink_log_info(&mavlink_log_pub, "Data link regained");
@@ -3598,7 +3678,6 @@ void Commander::data_link_check()
 					_datalink_last_status_avoidance_system = telemetry.remote_system_status;
 
 					if (_avoidance_system_lost) {
-						mavlink_log_info(&mavlink_log_pub, "Avoidance system regained");
 						_status_changed = true;
 						_avoidance_system_lost = false;
 						status_flags.avoidance_system_valid = true;
@@ -3638,42 +3717,29 @@ void Commander::data_link_check()
 	// AVOIDANCE SYSTEM state check (only if it is enabled)
 	if (status_flags.avoidance_system_required && !_onboard_controller_lost) {
 
-		//if avoidance never started
-		if (_datalink_last_heartbeat_avoidance_system == 0
-		    && hrt_elapsed_time(&_datalink_last_heartbeat_avoidance_system) > _param_com_oa_boot_t.get() * 1_s) {
-			if (!_print_avoidance_msg_once) {
-				mavlink_log_critical(&mavlink_log_pub, "Avoidance system not available");
-				_print_avoidance_msg_once = true;
-
-			}
-		}
-
 		//if heartbeats stop
 		if (!_avoidance_system_lost && (_datalink_last_heartbeat_avoidance_system > 0)
 		    && (hrt_elapsed_time(&_datalink_last_heartbeat_avoidance_system) > 5_s)) {
 			_avoidance_system_lost = true;
-			mavlink_log_critical(&mavlink_log_pub, "Avoidance system lost");
 			status_flags.avoidance_system_valid = false;
-			_print_avoidance_msg_once = false;
 		}
 
 		//if status changed
 		if (_avoidance_system_status_change) {
 			if (_datalink_last_status_avoidance_system == telemetry_status_s::MAV_STATE_BOOT) {
-				mavlink_log_info(&mavlink_log_pub, "Avoidance system starting");
+				status_flags.avoidance_system_valid = false;
 			}
 
 			if (_datalink_last_status_avoidance_system == telemetry_status_s::MAV_STATE_ACTIVE) {
-				mavlink_log_info(&mavlink_log_pub, "Avoidance system connected");
 				status_flags.avoidance_system_valid = true;
 			}
 
 			if (_datalink_last_status_avoidance_system == telemetry_status_s::MAV_STATE_CRITICAL) {
-				mavlink_log_info(&mavlink_log_pub, "Avoidance system timed out");
+				status_flags.avoidance_system_valid = false;
+				_status_changed = true;
 			}
 
 			if (_datalink_last_status_avoidance_system == telemetry_status_s::MAV_STATE_FLIGHT_TERMINATION) {
-				mavlink_log_critical(&mavlink_log_pub, "Avoidance system rejected");
 				status_flags.avoidance_system_valid = false;
 				_status_changed = true;
 			}
@@ -3696,70 +3762,139 @@ void Commander::data_link_check()
 	}
 }
 
+void Commander::avoidance_check()
+{
+
+	for (unsigned i = 0; i < ORB_MULTI_MAX_INSTANCES; i++) {
+		if (_sub_distance_sensor[i].updated()) {
+			distance_sensor_s distance_sensor {};
+			_sub_distance_sensor[i].copy(&distance_sensor);
+
+			if ((distance_sensor.orientation != distance_sensor_s::ROTATION_DOWNWARD_FACING) &&
+			    (distance_sensor.orientation != distance_sensor_s::ROTATION_UPWARD_FACING)) {
+				_valid_distance_sensor_time_us = distance_sensor.timestamp;
+			}
+		}
+	}
+
+	const bool cp_enabled =  _param_cp_dist.get() > 0.f;
+
+	const bool distance_sensor_valid = hrt_elapsed_time(&_valid_distance_sensor_time_us) < 500_ms;
+	const bool cp_healthy = status_flags.avoidance_system_valid || distance_sensor_valid;
+
+	const bool sensor_oa_present = cp_healthy || status_flags.avoidance_system_required || cp_enabled;
+
+	const bool auto_mode = _internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_MISSION
+			       || _internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_LOITER
+			       || _internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_RTL
+			       || _internal_state.main_state == commander_state_s::MAIN_STATE_OFFBOARD
+			       || _internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_TAKEOFF
+			       || _internal_state.main_state == commander_state_s::MAIN_STATE_AUTO_LAND;
+	const bool pos_ctl_mode = _internal_state.main_state == commander_state_s::MAIN_STATE_POSCTL;
+
+	const bool sensor_oa_enabled = ((auto_mode && status_flags.avoidance_system_required) || (pos_ctl_mode && cp_enabled));
+	const bool sensor_oa_healthy = ((auto_mode && status_flags.avoidance_system_valid) || (pos_ctl_mode && cp_healthy));
+
+	set_health_flags(subsystem_info_s::SUBSYSTEM_TYPE_OBSTACLE_AVOIDANCE, sensor_oa_present, sensor_oa_enabled,
+			 sensor_oa_healthy, status);
+}
+
 void Commander::battery_status_check()
 {
-	/* update battery status */
-	if (_battery_sub.updated()) {
-		battery_status_s battery{};
+	bool battery_sub_updated = false;
 
-		if (_battery_sub.copy(&battery)) {
+	battery_status_s batteries[ORB_MULTI_MAX_INSTANCES];
+	size_t num_connected_batteries = 0;
 
+	for (size_t i = 0; i < sizeof(_battery_subs) / sizeof(_battery_subs[0]); i++) {
+		// We need to update the status flag if ANY battery is updated, because the system source might have
+		// changed, or might be nothing (if there is no battery connected)
+		battery_sub_updated |= _battery_subs[i].updated();
 
-			bool battery_warning_level_increased_while_armed = false;
-			bool update_internal_battery_state = false;
+		if (_battery_subs[i].copy(&batteries[num_connected_batteries])) {
+			if (batteries[num_connected_batteries].connected) {
+				num_connected_batteries++;
+			}
+		}
+	}
 
-			if (armed.armed) {
-				if (battery.warning > _battery_warning) {
-					battery_warning_level_increased_while_armed = true;
-					update_internal_battery_state = true;
-				}
+	if (!battery_sub_updated) {
+		// Nothing has changed since the last time this function was called, so nothing needs to be done now.
+		return;
+	}
+
+	// There are possibly multiple batteries, and we can't know which ones serve which purpose. So the safest
+	// option is to check if ANY of them have a warning, and specifically find which one has the most
+	// urgent warning.
+	uint8_t worst_warning = battery_status_s::BATTERY_WARNING_NONE;
+	// To make sure that all connected batteries are being regularly reported, we check which one has the
+	// oldest timestamp.
+	hrt_abstime oldest_update = hrt_absolute_time();
+
+	_battery_current = 0.0f;
+
+	// Only iterate over connected batteries. We don't care if a disconnected battery is not regularly publishing.
+	for (size_t i = 0; i < num_connected_batteries; i++) {
+		if (batteries[i].warning > worst_warning) {
+			worst_warning = batteries[i].warning;
+		}
+
+		if (hrt_elapsed_time(&batteries[i].timestamp) > hrt_elapsed_time(&oldest_update)) {
+			oldest_update = batteries[i].timestamp;
+		}
+
+		// Sum up current from all batteries.
+		_battery_current += batteries[i].current_filtered_a;
+	}
+
+	bool battery_warning_level_increased_while_armed = false;
+	bool update_internal_battery_state = false;
+
+	if (armed.armed) {
+		if (worst_warning > _battery_warning) {
+			battery_warning_level_increased_while_armed = true;
+			update_internal_battery_state = true;
+		}
+
+	} else {
+		if (_battery_warning != worst_warning) {
+			update_internal_battery_state = true;
+		}
+	}
+
+	if (update_internal_battery_state) {
+		_battery_warning = worst_warning;
+	}
+
+	status_flags.condition_battery_healthy =
+		// All connected batteries are regularly being published
+		(hrt_elapsed_time(&oldest_update) < 5_s)
+		// There is at least one connected battery (in any slot)
+		&& (num_connected_batteries > 0)
+		// No currently-connected batteries have any warning
+		&& (_battery_warning == battery_status_s::BATTERY_WARNING_NONE);
+
+	// execute battery failsafe if the state has gotten worse while we are armed
+	if (battery_warning_level_increased_while_armed) {
+		battery_failsafe(&mavlink_log_pub, status, status_flags, &_internal_state, _battery_warning,
+				 (low_battery_action_t)_param_com_low_bat_act.get());
+	}
+
+	// Handle shutdown request from emergency battery action
+	if (update_internal_battery_state) {
+
+		if ((_battery_warning == battery_status_s::BATTERY_WARNING_EMERGENCY) && shutdown_if_allowed()) {
+			mavlink_log_critical(&mavlink_log_pub, "Dangerously low battery! Shutting system down");
+			px4_usleep(200000);
+
+			int ret_val = px4_shutdown_request(false, false);
+
+			if (ret_val) {
+				mavlink_log_critical(&mavlink_log_pub, "System does not support shutdown");
 
 			} else {
-				if (_battery_warning != battery.warning) {
-					update_internal_battery_state = true;
-				}
+				while (1) { px4_usleep(1); }
 			}
-
-			if (update_internal_battery_state) {
-				_battery_warning = battery.warning;
-			}
-
-
-			if ((hrt_elapsed_time(&battery.timestamp) < 5_s)
-			    && battery.connected
-			    && (_battery_warning == battery_status_s::BATTERY_WARNING_NONE)) {
-
-				status_flags.condition_battery_healthy = true;
-
-			} else {
-				status_flags.condition_battery_healthy = false;
-			}
-
-			// execute battery failsafe if the state has gotten worse while we are armed
-			if (battery_warning_level_increased_while_armed) {
-				battery_failsafe(&mavlink_log_pub, status, status_flags, &_internal_state, battery.warning,
-						 (low_battery_action_t)_param_com_low_bat_act.get());
-			}
-
-			// Handle shutdown request from emergency battery action
-			if (update_internal_battery_state) {
-
-				if ((_battery_warning == battery_status_s::BATTERY_WARNING_EMERGENCY) && shutdown_if_allowed()) {
-					mavlink_log_critical(&mavlink_log_pub, "Dangerously low battery! Shutting system down");
-					px4_usleep(200000);
-
-					int ret_val = px4_shutdown_request(false, false);
-
-					if (ret_val) {
-						mavlink_log_critical(&mavlink_log_pub, "System does not support shutdown");
-
-					} else {
-						while (1) { px4_usleep(1); }
-					}
-				}
-			}
-
-			_battery_current = battery.current_filtered_a;
 		}
 	}
 }
@@ -3874,13 +4009,6 @@ void Commander::estimator_check()
 		}
 	}
 
-	if ((_last_condition_global_position_valid != status_flags.condition_global_position_valid)
-	    && status_flags.condition_global_position_valid) {
-		// If global position state changed and is now valid, set respective health flags to true. For now also assume GPS is OK if global pos is OK, but not vice versa.
-		set_health_flags_healthy(subsystem_info_s::SUBSYSTEM_TYPE_AHRS, true, status);
-		set_health_flags_present_healthy(subsystem_info_s::SUBSYSTEM_TYPE_GPS, true, true, status);
-	}
-
 	check_valid(lpos.timestamp, _param_com_pos_fs_delay.get() * 1_s, lpos.z_valid,
 		    &(status_flags.condition_local_altitude_valid), &_status_changed);
 }
@@ -3890,17 +4018,7 @@ Commander::offboard_control_update()
 {
 	const offboard_control_mode_s &offboard_control_mode = _offboard_control_mode_sub.get();
 
-	// if this is the first time entering OFFBOARD the subscription may not be active yet
-	bool force_update = false;
-
-	if (commander_state_s::MAIN_STATE_OFFBOARD) {
-		if (offboard_control_mode.timestamp == 0) {
-			_offboard_control_mode_sub.subscribe();
-			force_update = true;
-		}
-	}
-
-	if (_offboard_control_mode_sub.updated() || force_update) {
+	if (_offboard_control_mode_sub.updated()) {
 		const offboard_control_mode_s old = offboard_control_mode;
 
 		if (_offboard_control_mode_sub.update()) {
@@ -3919,38 +4037,16 @@ Commander::offboard_control_update()
 		}
 	}
 
-	if (offboard_control_mode.timestamp != 0 &&
-	    offboard_control_mode.timestamp + OFFBOARD_TIMEOUT > hrt_absolute_time()) {
-		if (status_flags.offboard_control_signal_lost) {
-			status_flags.offboard_control_signal_lost = false;
-			status_flags.offboard_control_loss_timeout = false;
-			_status_changed = true;
-		}
+	_offboard_available.set_state_and_update(
+		hrt_elapsed_time(&offboard_control_mode.timestamp) < _param_com_of_loss_t.get() * 1e6f,
+		hrt_absolute_time());
 
-	} else {
-		if (!status_flags.offboard_control_signal_lost) {
-			status_flags.offboard_control_signal_lost = true;
-			_status_changed = true;
-		}
+	const bool offboard_lost = !_offboard_available.get_state();
 
-		/* check timer if offboard was there but now lost */
-		if (!status_flags.offboard_control_loss_timeout && offboard_control_mode.timestamp != 0) {
-			if (_param_com_of_loss_t.get() < FLT_EPSILON) {
-				/* execute loss action immediately */
-				status_flags.offboard_control_loss_timeout = true;
-
-			} else {
-				/* wait for timeout if set */
-				status_flags.offboard_control_loss_timeout = offboard_control_mode.timestamp +
-						OFFBOARD_TIMEOUT + _param_com_of_loss_t.get() * 1e6f < hrt_absolute_time();
-			}
-
-			if (status_flags.offboard_control_loss_timeout) {
-				_status_changed = true;
-			}
-		}
+	if (status_flags.offboard_control_signal_lost != offboard_lost) {
+		status_flags.offboard_control_signal_lost = offboard_lost;
+		_status_changed = true;
 	}
-
 }
 
 void Commander::esc_status_check(const esc_status_s &esc_status)
@@ -4004,6 +4100,7 @@ The commander module contains the state machine for mode switching and failsafe 
 	PRINT_MODULE_USAGE_NAME("commander", "system");
 	PRINT_MODULE_USAGE_COMMAND("start");
 	PRINT_MODULE_USAGE_PARAM_FLAG('h', "Enable HIL mode", true);
+#ifndef CONSTRAINED_FLASH
 	PRINT_MODULE_USAGE_COMMAND_DESCR("calibrate", "Run sensor calibration");
 	PRINT_MODULE_USAGE_ARG("mag|accel|gyro|level|esc|airspeed", "Calibration type", false);
 	PRINT_MODULE_USAGE_COMMAND_DESCR("check", "Run preflight checks");
@@ -4018,6 +4115,7 @@ The commander module contains the state machine for mode switching and failsafe 
 			"Flight mode", false);
 	PRINT_MODULE_USAGE_COMMAND("lockdown");
 	PRINT_MODULE_USAGE_ARG("off", "Turn lockdown off", true);
+#endif
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
 
 	return 1;

@@ -7,7 +7,7 @@ px4_add_board(
 	TOOLCHAIN arm-none-eabi
 	ARCHITECTURE cortex-m7
 	ROMFSROOT px4fmu_common
-	#BUILD_BOOTLOADER
+	BUILD_BOOTLOADER
 	IO px4_io-v2_default
 	TESTING
 #	UAVCAN_INTERFACES 2  - No H7 or FD can support in UAVCAN
@@ -25,7 +25,7 @@ px4_add_board(
 		#camera_trigger
 		differential_pressure # all available differential pressure drivers
 		distance_sensor # all available distance sensor drivers
-		# dshot -- todo needslooking at
+		#dshot
 		gps
 		heater
 		#imu # all available imu drivers
@@ -33,8 +33,7 @@ px4_add_board(
 		#imu/adis16477
 		#imu/adis16497
 		#imu/bmi088
-		imu/mpu6000
-		#imu/mpu9250
+		imu/invensense/icm20689
 		#irlock
 		#lights/blinkm
 		#lights/rgbled
@@ -49,7 +48,7 @@ px4_add_board(
 #		pwm_input  - Need to create arch/stm32 arch/stm32h7 arch/kinetis and reloacate
 #					   all arch dependant code there
 		pwm_out_sim
-		px4fmu
+		pwm_out
 		px4io
 		#roboclaw
 		#tap_esc
@@ -75,17 +74,19 @@ px4_add_board(
 		logger
 		mavlink
 		mc_att_control
+		mc_hover_thrust_estimator
 		mc_pos_control
 		mc_rate_control
 		navigator
+		rc_update
 		#rover_pos_control
 		sensors
 		#sih
+		temperature_compensation
 		vmount
 		vtol_att_control
 	SYSTEMCMDS
-		#bl_update
-		#config
+		bl_update
 		dmesg
 		dumpfile
 		esc_calib
@@ -112,7 +113,6 @@ px4_add_board(
 		ver
 		work_queue
 	EXAMPLES
-		#bottle_drop # OBC challenge
 		#fixedwing_control # Tutorial code from https://px4.io/dev/example_fixedwing_control
 		#hello
 		#hwtest # Hardware test
@@ -121,4 +121,5 @@ px4_add_board(
 		#px4_simple_app # Tutorial code from http://dev.px4.io/en/apps/hello_sky.html
 		#rover_steering_control # Rover example app
 		#uuv_example_app
+		#work_item
 	)

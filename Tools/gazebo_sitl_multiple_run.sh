@@ -17,21 +17,29 @@ then
 	exit 1
 fi
 
-while getopts n:m: option
+while getopts n:m:w: option
 do
 	case "${option}"
 	in
 		n) NUM_VEHICLES=${OPTARG};;
 		m) VEHICLE_MODEL=${OPTARG};;
+		w) WORLD=${OPTARG};;
 	esac
 done
 
 num_vehicles=${NUM_VEHICLES:=3}
 export PX4_SIM_MODEL=${VEHICLE_MODEL:=iris}
+world=${WORLD:=empty}
 
-if [ "$PX4_SIM_MODEL" != "iris" ]
+if [ "$PX4_SIM_MODEL" != "iris" ] && [ "$PX4_SIM_MODEL" != "plane" ] && [ "$PX4_SIM_MODEL" != "standard_vtol" ]
 then
-	echo "Currently only iris vehicle model is supported!"
+	echo "Currently only the following vehicle models are supported! [iris, plane, standard_vtol]"
+	exit 1
+fi
+
+if [ $num_vehicles -gt 255 ]
+then
+	echo "Tried spawning $num_vehicles vehicles. The maximum number of supported vehicles is 255"
 	exit 1
 fi
 
@@ -41,7 +49,6 @@ src_path="$SCRIPT_DIR/.."
 build_path=${src_path}/build/px4_sitl_default
 mavlink_udp_port=14560
 mavlink_tcp_port=4560
-world="empty"
 
 echo "killing running instances"
 pkill -x px4 || true
@@ -66,9 +73,10 @@ while [ $n -lt $num_vehicles ]; do
 		rotors_description_dir:=${src_path}/Tools/sitl_gazebo/models/rotors_description mavlink_udp_port:=$(($mavlink_udp_port+$n)) \
 		mavlink_tcp_port:=$(($mavlink_tcp_port+$n))  -o /tmp/${PX4_SIM_MODEL}_${n}.urdf
 
+	gz sdf -p  /tmp/${PX4_SIM_MODEL}_${n}.urdf > /tmp/${PX4_SIM_MODEL}_${n}.sdf
 	echo "Spawning ${PX4_SIM_MODEL}_${n}"
 
-	gz model --spawn-file=/tmp/${PX4_SIM_MODEL}_${n}.urdf --model-name=${PX4_SIM_MODEL}_${n} -x 0.0 -y ${n} -z 0.0
+	gz model --spawn-file=/tmp/${PX4_SIM_MODEL}_${n}.sdf --model-name=${PX4_SIM_MODEL}_${n} -x 0.0 -y $((3*${n})) -z 0.0
 
 	popd &>/dev/null
 

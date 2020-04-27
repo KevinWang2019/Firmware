@@ -61,11 +61,13 @@
 #include <uORB/topics/airspeed.h>
 #include <uORB/topics/battery_status.h>
 #include <uORB/topics/cpuload.h>
+#include <uORB/topics/distance_sensor.h>
 #include <uORB/topics/esc_status.h>
 #include <uORB/topics/estimator_status.h>
 #include <uORB/topics/geofence_result.h>
 #include <uORB/topics/iridiumsbd_status.h>
 #include <uORB/topics/manual_control_setpoint.h>
+#include <uORB/topics/mission.h>
 #include <uORB/topics/mission_result.h>
 #include <uORB/topics/offboard_control_mode.h>
 #include <uORB/topics/parameter_update.h>
@@ -131,6 +133,8 @@ private:
 	 */
 	void data_link_check();
 
+	void avoidance_check();
+
 	void esc_status_check(const esc_status_s &esc_status);
 
 	void estimator_check();
@@ -195,7 +199,6 @@ private:
 		(ParamFloat<px4::params::COM_DISARM_PRFLT>) _param_com_disarm_preflight,
 
 		(ParamBool<px4::params::COM_OBS_AVOID>) _param_com_obs_avoid,
-		(ParamInt<px4::params::COM_OA_BOOT_T>) _param_com_oa_boot_t,
 
 		(ParamInt<px4::params::COM_FLT_PROFILE>) _param_com_flt_profile,
 
@@ -223,7 +226,7 @@ private:
 		(ParamInt<px4::params::COM_FLIGHT_UUID>) _param_flight_uuid,
 		(ParamInt<px4::params::COM_TAKEOFF_ACT>) _param_takeoff_finished_action,
 
-		(ParamBool<px4::params::COM_RC_OVERRIDE>) _param_rc_override,
+		(ParamInt<px4::params::COM_RC_OVERRIDE>) _param_rc_override,
 		(ParamInt<px4::params::COM_RC_IN_MODE>) _param_rc_in_off,
 		(ParamInt<px4::params::COM_RC_ARM_HYST>) _param_rc_arm_hyst,
 		(ParamFloat<px4::params::COM_RC_STICK_OV>) _param_min_stick_change,
@@ -240,9 +243,9 @@ private:
 		(ParamInt<px4::params::CBRK_USB_CHK>) _param_cbrk_usb_chk,
 		(ParamInt<px4::params::CBRK_AIRSPD_CHK>) _param_cbrk_airspd_chk,
 		(ParamInt<px4::params::CBRK_ENGINEFAIL>) _param_cbrk_enginefail,
-		(ParamInt<px4::params::CBRK_GPSFAIL>) _param_cbrk_gpsfail,
 		(ParamInt<px4::params::CBRK_FLIGHTTERM>) _param_cbrk_flightterm,
 		(ParamInt<px4::params::CBRK_VELPOSERR>) _param_cbrk_velposerr,
+		(ParamInt<px4::params::CBRK_VTOLARMING>) _param_cbrk_vtolarming,
 
 		// Geofrence
 		(ParamInt<px4::params::GF_ACTION>) _param_geofence_action,
@@ -250,7 +253,9 @@ private:
 		// Mavlink
 		(ParamInt<px4::params::MAV_COMP_ID>) _param_mav_comp_id,
 		(ParamInt<px4::params::MAV_SYS_ID>) _param_mav_sys_id,
-		(ParamInt<px4::params::MAV_TYPE>) _param_mav_type
+		(ParamInt<px4::params::MAV_TYPE>) _param_mav_type,
+
+		(ParamFloat<px4::params::CP_DIST>) _param_cp_dist
 	)
 
 	enum class PrearmedMode {
@@ -259,13 +264,18 @@ private:
 		ALWAYS = 2
 	};
 
+	enum OverrideMode {
+		OVERRIDE_DISABLED = 0,
+		OVERRIDE_AUTO_MODE_BIT = (1 << 0),
+		OVERRIDE_OFFBOARD_MODE_BIT = (1 << 1)
+	};
+
 	/* Decouple update interval and hysteresis counters, all depends on intervals */
 	static constexpr uint64_t COMMANDER_MONITORING_INTERVAL{10_ms};
 	static constexpr float COMMANDER_MONITORING_LOOPSPERMSEC{1 / (COMMANDER_MONITORING_INTERVAL / 1000.0f)};
 
 	static constexpr float STICK_ON_OFF_LIMIT{0.9f};
 
-	static constexpr uint64_t OFFBOARD_TIMEOUT{500_ms};
 	static constexpr uint64_t HOTPLUG_SENS_TIMEOUT{8_s};	/**< wait for hotplug sensors to come online for upto 8 seconds */
 	static constexpr uint64_t PRINT_MODE_REJECT_INTERVAL{500_ms};
 	static constexpr uint64_t INAIR_RESTART_HOLDOFF_INTERVAL{500_ms};
@@ -274,6 +284,8 @@ private:
 	const int64_t POSVEL_PROBATION_MAX = 100_s;	/**< maximum probation duration (usec) */
 
 	PreFlightCheck::arm_requirements_t	_arm_requirements{};
+
+	hrt_abstime	_valid_distance_sensor_time_us{0}; /**< Last time that distance sensor data arrived (usec) */
 
 	hrt_abstime	_last_gpos_fail_time_us{0};	/**< Last time that the global position validity recovery check failed (usec) */
 	hrt_abstime	_last_lpos_fail_time_us{0};	/**< Last time that the local position validity recovery check failed (usec) */
@@ -297,6 +309,7 @@ private:
 
 	FailureDetector	_failure_detector;
 	bool		_flight_termination_triggered{false};
+	bool		_lockdown_triggered{false};
 
 
 	hrt_abstime	_datalink_last_heartbeat_gcs{0};
@@ -317,8 +330,7 @@ private:
 
 	Hysteresis	_auto_disarm_landed{false};
 	Hysteresis	_auto_disarm_killed{false};
-
-	bool		_print_avoidance_msg_once{false};
+	Hysteresis	_offboard_available{false};
 
 	hrt_abstime	_last_print_mode_reject_time{0};	///< To remember when last notification was sent
 
@@ -350,10 +362,10 @@ private:
 	bool		_status_changed{true};
 	bool		_arm_tune_played{false};
 	bool		_was_landed{true};
-	bool		_was_falling{false};
 	bool		_was_armed{false};
 	bool		_failsafe_old{false};	///< check which state machines for changes, clear "changed" flag
 	bool		_have_taken_off_since_arming{false};
+	bool		_should_set_home_on_takeoff{true};
 	bool		_flight_termination_printed{false};
 
 	main_state_t	_main_state_pre_offboard{commander_state_s::MAIN_STATE_MANUAL};
@@ -367,9 +379,21 @@ private:
 
 	// Subscriptions
 	uORB::Subscription					_actuator_controls_sub{ORB_ID_VEHICLE_ATTITUDE_CONTROLS};
-	uORB::Subscription					_battery_sub{ORB_ID(battery_status)};
-	uORB::Subscription					_cmd_sub{ORB_ID(vehicle_command)};
+#if BOARD_NUMBER_BRICKS > 1
+	uORB::Subscription					_battery_subs[ORB_MULTI_MAX_INSTANCES] {
+		uORB::Subscription(ORB_ID(battery_status), 0),
+		uORB::Subscription(ORB_ID(battery_status), 1),
+		uORB::Subscription(ORB_ID(battery_status), 2),
+		uORB::Subscription(ORB_ID(battery_status), 3),
+	};
+#else
+	uORB::Subscription					_battery_subs[1] {
+		uORB::Subscription(ORB_ID(battery_status), 0)
+	};
+#endif
+	uORB::Subscription					_cmd_sub {ORB_ID(vehicle_command)};
 	uORB::Subscription					_cpuload_sub{ORB_ID(cpuload)};
+	uORB::Subscription					_sub_distance_sensor[ORB_MULTI_MAX_INSTANCES] {{ORB_ID(distance_sensor), 0}, {ORB_ID(distance_sensor), 1}, {ORB_ID(distance_sensor), 2}, {ORB_ID(distance_sensor), 3}}; /**< distance data received from onboard rangefinders */
 	uORB::Subscription					_esc_status_sub{ORB_ID(esc_status)};
 	uORB::Subscription					_geofence_result_sub{ORB_ID(geofence_result)};
 	uORB::Subscription					_iridiumsbd_status_sub{ORB_ID(iridiumsbd_status)};
@@ -398,6 +422,7 @@ private:
 	uORB::Publication<vehicle_control_mode_s>		_control_mode_pub{ORB_ID(vehicle_control_mode)};
 	uORB::Publication<vehicle_status_flags_s>		_vehicle_status_flags_pub{ORB_ID(vehicle_status_flags)};
 	uORB::Publication<vehicle_status_s>			_status_pub{ORB_ID(vehicle_status)};
+	uORB::Publication<mission_s>				_mission_pub{ORB_ID(mission)};
 
 	uORB::PublicationData<home_position_s>			_home_pub{ORB_ID(home_position)};
 
