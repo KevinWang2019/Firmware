@@ -53,7 +53,7 @@ fi
 
 
 # check ubuntu version
-# instructions for 16.04, 18.04
+# instructions for 16.04, 18.04, 20.04
 # otherwise warn and point to docker?
 UBUNTU_RELEASE=`lsb_release -rs`
 
@@ -64,6 +64,8 @@ elif [[ "${UBUNTU_RELEASE}" == "16.04" ]]; then
 	echo "Ubuntu 16.04"
 elif [[ "${UBUNTU_RELEASE}" == "18.04" ]]; then
 	echo "Ubuntu 18.04"
+elif [[ "${UBUNTU_RELEASE}" == "20.04" ]]; then
+	echo "Ubuntu 20.04"
 fi
 
 
@@ -190,6 +192,7 @@ if [[ $INSTALL_SIM == "true" ]]; then
 		gstreamer1.0-plugins-base \
 		gstreamer1.0-plugins-good \
 		gstreamer1.0-plugins-ugly \
+		gstreamer1.0-libav \
 		libeigen3-dev \
 		libgazebo9-dev \
 		libgstreamer-plugins-base1.0-dev \
