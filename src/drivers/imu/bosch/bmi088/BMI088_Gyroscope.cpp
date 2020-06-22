@@ -82,8 +82,6 @@ void BMI088_Gyroscope::print_status()
 	perf_print_counter(_fifo_overflow_perf);
 	perf_print_counter(_fifo_reset_perf);
 	perf_print_counter(_drdy_interval_perf);
-
-	_px4_gyro.print_status();
 }
 
 int BMI088_Gyroscope::probe()
@@ -410,7 +408,7 @@ bool BMI088_Gyroscope::FIFORead(const hrt_abstime &timestamp_sample, uint8_t sam
 
 	perf_end(_transfer_perf);
 
-	PX4Gyroscope::FIFOSample gyro;
+	sensor_gyro_fifo_s gyro{};
 	gyro.timestamp_sample = timestamp_sample;
 	gyro.samples = samples;
 	gyro.dt = FIFO_SAMPLE_DT;

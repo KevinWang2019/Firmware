@@ -193,11 +193,13 @@ void Simulator::send_controls()
 
 void Simulator::update_sensors(const hrt_abstime &time, const mavlink_hil_sensor_t &sensors)
 {
+	float temperature = NAN;
+
 	// temperature only updated with baro
 	if ((sensors.fields_updated & SensorSource::BARO) == SensorSource::BARO) {
-		float temperature = sensors.temperature;
+		if (PX4_ISFINITE(sensors.temperature)) {
+			temperature = sensors.temperature;
 
-		if (PX4_ISFINITE(temperature)) {
 			_px4_accel.set_temperature(temperature);
 			_px4_baro.set_temperature(temperature);
 			_px4_gyro.set_temperature(temperature);
@@ -229,7 +231,7 @@ void Simulator::update_sensors(const hrt_abstime &time, const mavlink_hil_sensor
 	if ((sensors.fields_updated & SensorSource::DIFF_PRESS) == SensorSource::DIFF_PRESS && !_param_sim_dpres_block.get()) {
 		differential_pressure_s report{};
 		report.timestamp = time;
-		report.temperature = sensors.temperature;
+		report.temperature = temperature;
 		report.differential_pressure_filtered_pa = sensors.diff_pressure * 100.0f; // convert from millibar to bar;
 		report.differential_pressure_raw_pa = sensors.diff_pressure * 100.0f; // convert from millibar to bar;
 
@@ -309,14 +311,21 @@ void Simulator::handle_message_hil_gps(const mavlink_message_t *msg)
 		gps.satellites_used = hil_gps.satellites_visible;
 		gps.s_variance_m_s = 0.25f;
 
-		// use normal distribution for noise
-		if (_param_sim_gps_noise_x.get() > 0.0f) {
-			std::normal_distribution<float> normal_distribution(0.0f, 1.0f);
-			gps.lat += (int32_t)(_param_sim_gps_noise_x.get() * normal_distribution(_gen));
-			gps.lon += (int32_t)(_param_sim_gps_noise_x.get() * normal_distribution(_gen));
-		}
+		// New publishers will be created based on the HIL_GPS ID's being different or not
+		for (size_t i = 0; i < sizeof(_gps_ids) / sizeof(_gps_ids[0]); i++) {
+			if (_vehicle_gps_position_pubs[i] && _gps_ids[i] == hil_gps.id) {
+				_vehicle_gps_position_pubs[i]->publish(gps);
+				break;
 
-		_vehicle_gps_position_pub.publish(gps);
+			}
+
+			if (_vehicle_gps_position_pubs[i] == nullptr) {
+				_vehicle_gps_position_pubs[i] = new uORB::PublicationMulti<vehicle_gps_position_s> {ORB_ID(vehicle_gps_position)};
+				_gps_ids[i] = hil_gps.id;
+				_vehicle_gps_position_pubs[i]->publish(gps);
+				break;
+			}
+		}
 	}
 }
 
@@ -1135,7 +1144,11 @@ int Simulator::publish_distance_topic(const mavlink_distance_sensor_t *dist_mavl
 	dist.type = dist_mavlink->type;
 	dist.id = dist_mavlink->id;
 	dist.variance = dist_mavlink->covariance * 1e-4f; // cm^2 to m^2
-	dist.signal_quality = -1;
+
+	// MAVLink DISTANCE_SENSOR signal_quality value of 0 means unset/unknown
+	// quality value. Also it comes normalised between 1 and 100 while the uORB
+	// signal quality is normalised between 0 and 100.
+	dist.signal_quality = dist_mavlink->signal_quality == 0 ? -1 : 100 * (dist_mavlink->signal_quality - 1) / 99;
 
 	switch (dist_mavlink->orientation) {
 	case MAV_SENSOR_ORIENTATION::MAV_SENSOR_ROTATION_PITCH_270:
