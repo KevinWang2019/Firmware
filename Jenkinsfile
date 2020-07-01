@@ -5,7 +5,12 @@ pipeline {
   stages {
 
     stage('Analysis') {
-
+      when {
+        anyOf {
+          branch 'master'
+          branch 'pr-jenkins' // for testing
+        }
+      }
       parallel {
 
         // TODO: temporarily disabled 2020-06-03 waiting on mavlink update
@@ -81,104 +86,6 @@ pipeline {
         //     checkoutToSubdirectory('colcon_ws/src/Firmware')
         //   }
         // }
-
-        stage('Clang analyzer') {
-          agent {
-            docker {
-              image 'px4io/px4-dev-clang:2020-04-01'
-              args '-e CCACHE_BASEDIR=$WORKSPACE -v ${CCACHE_DIR}:${CCACHE_DIR}:rw'
-            }
-          }
-          steps {
-            sh 'export'
-            sh 'make distclean'
-            sh 'git fetch --tags'
-            sh 'make scan-build'
-            // publish html
-            publishHTML target: [
-              reportTitles: 'clang static analyzer',
-              allowMissing: false,
-              alwaysLinkToLastBuild: true,
-              keepAll: true,
-              reportDir: 'build/scan-build/report_latest',
-              reportFiles: '*',
-              reportName: 'Clang Static Analyzer'
-            ]
-          }
-          post {
-            always {
-              sh 'make distclean'
-            }
-          }
-          when {
-            anyOf {
-              branch 'master'
-              branch 'beta'
-              branch 'stable'
-              branch 'pr-jenkins' // for testing
-            }
-          }
-        }
-
-        stage('Clang tidy') {
-          agent {
-            docker {
-              image 'px4io/px4-dev-clang:2020-04-01'
-              args '-e CCACHE_BASEDIR=$WORKSPACE -v ${CCACHE_DIR}:${CCACHE_DIR}:rw'
-            }
-          }
-          steps {
-            sh 'export'
-            sh 'make distclean'
-            sh 'git fetch --tags'
-            retry (3) {
-              sh 'make clang-tidy-quiet'
-            }
-          }
-          post {
-            always {
-              sh 'make distclean'
-            }
-          }
-        }
-
-        stage('Cppcheck') {
-          agent {
-            docker {
-              image 'px4io/px4-dev-ros-melodic:2020-04-01'
-              args '-e CCACHE_BASEDIR=$WORKSPACE -v ${CCACHE_DIR}:${CCACHE_DIR}:rw'
-            }
-          }
-          steps {
-            sh 'export'
-            sh 'make distclean'
-            sh 'git fetch --tags'
-            sh 'make cppcheck'
-            // publish html
-            publishHTML target: [
-              reportTitles: 'Cppcheck',
-              allowMissing: false,
-              alwaysLinkToLastBuild: true,
-              keepAll: true,
-              reportDir: 'build/cppcheck/',
-              reportFiles: '*',
-              reportName: 'Cppcheck'
-            ]
-          }
-          post {
-            always {
-              sh 'make distclean'
-            }
-          }
-          when {
-            anyOf {
-              branch 'master'
-              branch 'beta'
-              branch 'stable'
-              branch 'pr-jenkins' // for testing
-            }
-          }
-        }
 
         stage('Airframe') {
           agent {

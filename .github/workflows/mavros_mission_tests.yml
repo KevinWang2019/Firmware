@@ -19,7 +19,6 @@ jobs:
           - {vehicle: "rover",         mission: "rover_mission_1", build_type: "RelWithDebInfo"}
           - {vehicle: "plane",         mission: "FW_mission_1",    build_type: "RelWithDebInfo"}
           - {vehicle: "plane_catapult",mission: "FW_mission_1",    build_type: "RelWithDebInfo"}
-          - {vehicle: "standard_vtol", mission: "VTOL_mission_1",  build_type: "RelWithDebInfo"}
           - {vehicle: "standard_vtol", mission: "VTOL_mission_1",  build_type: "Coverage"}
           - {vehicle: "standard_vtol", mission: "VTOL_mission_1",  build_type: "AddressSanitizer"}
           #- {vehicle: "tailsitter",    mission: "VTOL_mission_1",  build_type: "RelWithDebInfo"}
@@ -90,7 +89,7 @@ jobs:
 
     - name: ecl EKF analysis
       if: always()
-      run: ./Tools/ecl_ekf/process_logdata_ekf.py ~/.ros/log/*/*.ulg
+      run: ./Tools/ecl_ekf/process_logdata_ekf.py ~/.ros/log/*/*.ulg || true
 
     - name: Upload logs to flight review
       if: always()
