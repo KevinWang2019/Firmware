@@ -267,6 +267,10 @@ MavlinkReceiver::handle_message(mavlink_message_t *msg)
 		handle_message_onboard_computer_status(msg);
 		break;
 
+	case MAVLINK_MSG_ID_GENERATOR_STATUS:
+		handle_message_generator_status(msg);
+		break;
+
 	case MAVLINK_MSG_ID_STATUSTEXT:
 		handle_message_statustext(msg);
 		break;
@@ -471,6 +475,16 @@ void MavlinkReceiver::handle_message_command_both(mavlink_message_t *msg, const 
 		}
 
 		_actuator_controls_pubs[actuator_controls_s::GROUP_INDEX_GIMBAL].publish(actuator_controls);
+
+	} else if (cmd_mavlink.command == MAV_CMD_INJECT_FAILURE) {
+		if (_mavlink->failure_injection_enabled()) {
+			_cmd_pub.publish(vehicle_command);
+			send_ack = false;
+
+		} else {
+			result = vehicle_command_ack_s::VEHICLE_RESULT_DENIED;
+			send_ack = true;
+		}
 
 	} else {
 
@@ -811,6 +825,10 @@ MavlinkReceiver::handle_message_set_position_target_local_ned(mavlink_message_t 
 		bool is_land_sp = (bool)(set_position_target_local_ned.type_mask & 0x2000);
 		bool is_loiter_sp = (bool)(set_position_target_local_ned.type_mask & 0x3000);
 		bool is_idle_sp = (bool)(set_position_target_local_ned.type_mask & 0x4000);
+		bool is_gliding_sp = (bool)(set_position_target_local_ned.type_mask &
+					    (POSITION_TARGET_TYPEMASK::POSITION_TARGET_TYPEMASK_Z_IGNORE
+					     | POSITION_TARGET_TYPEMASK::POSITION_TARGET_TYPEMASK_VZ_IGNORE
+					     | POSITION_TARGET_TYPEMASK::POSITION_TARGET_TYPEMASK_AZ_IGNORE));
 
 		offboard_control_mode.timestamp = hrt_absolute_time();
 		_offboard_control_mode_pub.publish(offboard_control_mode);
@@ -850,6 +868,9 @@ MavlinkReceiver::handle_message_set_position_target_local_ned(mavlink_message_t 
 
 					} else if (is_idle_sp) {
 						pos_sp_triplet.current.type = position_setpoint_s::SETPOINT_TYPE_IDLE;
+
+					} else if (is_gliding_sp) {
+						pos_sp_triplet.current.cruising_throttle = 0.0f;
 
 					} else {
 						pos_sp_triplet.current.type = position_setpoint_s::SETPOINT_TYPE_POSITION;
@@ -1496,7 +1517,7 @@ MavlinkReceiver::handle_message_set_attitude_target(mavlink_message_t *msg)
 						att_sp.yaw_sp_move_rate = 0.0f;
 					}
 
-					if (!offboard_control_mode.ignore_thrust) { // dont't overwrite thrust if it's invalid
+					if (!offboard_control_mode.ignore_thrust) { // don't overwrite thrust if it's invalid
 						fill_thrust(att_sp.thrust_body, vehicle_status.vehicle_type, set_attitude_target.thrust);
 					}
 
@@ -1534,7 +1555,7 @@ MavlinkReceiver::handle_message_set_attitude_target(mavlink_message_t *msg)
 						rates_sp.yaw = set_attitude_target.body_yaw_rate;
 					}
 
-					if (!offboard_control_mode.ignore_thrust) { // dont't overwrite thrust if it's invalid
+					if (!offboard_control_mode.ignore_thrust) { // don't overwrite thrust if it's invalid
 						fill_thrust(rates_sp.thrust_body, vehicle_status.vehicle_type, set_attitude_target.thrust);
 					}
 
@@ -2045,25 +2066,61 @@ MavlinkReceiver::handle_message_heartbeat(mavlink_message_t *msg)
 {
 	/* telemetry status supported only on first TELEMETRY_STATUS_ORB_ID_NUM mavlink channels */
 	if (_mavlink->get_channel() < (mavlink_channel_t)ORB_MULTI_MAX_INSTANCES) {
+
+		const hrt_abstime now = hrt_absolute_time();
+
 		mavlink_heartbeat_t hb;
 		mavlink_msg_heartbeat_decode(msg, &hb);
 
-		/* Accept only heartbeats from GCS or ONBOARD Controller, skip heartbeats from other vehicles */
-		if ((msg->sysid != mavlink_system.sysid && hb.type == MAV_TYPE_GCS) || (msg->sysid == mavlink_system.sysid
-				&& hb.type == MAV_TYPE_ONBOARD_CONTROLLER)) {
+		const bool same_system = (msg->sysid == mavlink_system.sysid);
+
+		if (same_system || hb.type == MAV_TYPE_GCS) {
 
 			telemetry_status_s &tstatus = _mavlink->get_telemetry_status();
 
-			/* set heartbeat time and topic time and publish -
-			 * the telem status also gets updated on telemetry events
-			 */
-			tstatus.heartbeat_time = hrt_absolute_time();
-			tstatus.remote_system_id = msg->sysid;
-			tstatus.remote_component_id = msg->compid;
-			tstatus.remote_type = hb.type;
-			tstatus.remote_system_status = hb.system_status;
-		}
+			bool heartbeat_slot_found = false;
+			int heartbeat_slot = 0;
 
+			// find existing HEARTBEAT slot
+			for (size_t i = 0; i < (sizeof(tstatus.heartbeats) / sizeof(tstatus.heartbeats[0])); i++) {
+				if ((tstatus.heartbeats[i].system_id == msg->sysid)
+				    && (tstatus.heartbeats[i].component_id == msg->compid)
+				    && (tstatus.heartbeats[i].type == hb.type)) {
+
+					// found matching heartbeat slot
+					heartbeat_slot = i;
+					heartbeat_slot_found = true;
+					break;
+				}
+			}
+
+			// otherwise use first available slot
+			if (!heartbeat_slot_found) {
+				for (size_t i = 0; i < (sizeof(tstatus.heartbeats) / sizeof(tstatus.heartbeats[0])); i++) {
+					if ((tstatus.heartbeats[i].system_id == 0) && (tstatus.heartbeats[i].timestamp == 0)) {
+						heartbeat_slot = i;
+						heartbeat_slot_found = true;
+						break;
+					}
+				}
+			}
+
+			if (heartbeat_slot_found) {
+				_mavlink->lock_telemetry_status();
+
+				tstatus.heartbeats[heartbeat_slot].timestamp = now;
+				tstatus.heartbeats[heartbeat_slot].system_id = msg->sysid;
+				tstatus.heartbeats[heartbeat_slot].component_id = msg->compid;
+				tstatus.heartbeats[heartbeat_slot].type = hb.type;
+				tstatus.heartbeats[heartbeat_slot].state = hb.system_status;
+
+				_mavlink->telemetry_status_updated();
+				_mavlink->unlock_telemetry_status();
+
+			} else {
+				PX4_ERR("no telemetry heartbeat slots available");
+			}
+		}
 	}
 }
 
@@ -2230,7 +2287,7 @@ MavlinkReceiver::handle_message_hil_gps(mavlink_message_t *msg)
 
 	const uint64_t timestamp = hrt_absolute_time();
 
-	struct vehicle_gps_position_s hil_gps = {};
+	sensor_gps_s hil_gps{};
 
 	hil_gps.timestamp_time_relative = 0;
 	hil_gps.time_utc_usec = gps.time_usec;
@@ -2317,12 +2374,12 @@ MavlinkReceiver::handle_message_cellular_status(mavlink_message_t *msg)
 
 	cellular_status.timestamp = hrt_absolute_time();
 	cellular_status.status = status.status;
+	cellular_status.failure_reason = status.failure_reason;
 	cellular_status.type = status.type;
 	cellular_status.quality = status.quality;
 	cellular_status.mcc = status.mcc;
 	cellular_status.mnc = status.mnc;
 	cellular_status.lac = status.lac;
-	cellular_status.cid = status.cid;
 
 	_cellular_status_pub.publish(cellular_status);
 }
@@ -2564,7 +2621,7 @@ MavlinkReceiver::handle_message_hil_state_quaternion(mavlink_message_t *msg)
 		hil_local_pos.vz = hil_state.vz / 100.0f;
 
 		matrix::Eulerf euler{matrix::Quatf(hil_state.attitude_quaternion)};
-		hil_local_pos.yaw = euler.psi();
+		hil_local_pos.heading = euler.psi();
 		hil_local_pos.xy_global = true;
 		hil_local_pos.z_global = true;
 		hil_local_pos.vxy_max = INFINITY;
@@ -2725,6 +2782,28 @@ MavlinkReceiver::handle_message_onboard_computer_status(mavlink_message_t *msg)
 	memcpy(onboard_computer_status_topic.link_rx_max, status_msg.link_rx_max, sizeof(status_msg.link_rx_max));
 
 	_onboard_computer_status_pub.publish(onboard_computer_status_topic);
+}
+
+void MavlinkReceiver::handle_message_generator_status(mavlink_message_t *msg)
+{
+	mavlink_generator_status_t status_msg;
+	mavlink_msg_generator_status_decode(msg, &status_msg);
+
+	generator_status_s generator_status{};
+	generator_status.timestamp = hrt_absolute_time();
+	generator_status.status = status_msg.status;
+	generator_status.battery_current = status_msg.battery_current;
+	generator_status.load_current = status_msg.load_current;
+	generator_status.power_generated = status_msg.power_generated;
+	generator_status.bus_voltage = status_msg.bus_voltage;
+	generator_status.bat_current_setpoint = status_msg.bat_current_setpoint;
+	generator_status.runtime = status_msg.runtime;
+	generator_status.time_until_maintenance = status_msg.time_until_maintenance;
+	generator_status.generator_speed = status_msg.generator_speed;
+	generator_status.rectifier_temperature = status_msg.rectifier_temperature;
+	generator_status.generator_temperature = status_msg.generator_temperature;
+
+	_generator_status_pub.publish(generator_status);
 }
 
 void MavlinkReceiver::handle_message_statustext(mavlink_message_t *msg)
