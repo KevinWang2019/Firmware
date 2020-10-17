@@ -69,6 +69,7 @@
 #include <navigator/navigation.h>
 #include <px4_platform_common/px4_config.h>
 #include <px4_platform_common/defines.h>
+#include <px4_platform_common/external_reset_lockout.h>
 #include <px4_platform_common/posix.h>
 #include <px4_platform_common/shutdown.h>
 #include <px4_platform_common/tasks.h>
@@ -1593,7 +1594,7 @@ Commander::run()
 				if (_safety.safety_switch_available && previous_safety_off != _safety.safety_off) {
 
 					if (_safety.safety_off) {
-						set_tune(TONE_NOTIFY_POSITIVE_TUNE);
+						set_tune(tune_control_s::TUNE_ID_NOTIFY_POSITIVE);
 
 					} else {
 						tune_neutral(true);
@@ -2271,7 +2272,7 @@ Commander::run()
 						armed.force_failsafe = true;
 						_flight_termination_triggered = true;
 						mavlink_log_emergency(&mavlink_log_pub, "Critical failure detected: terminate flight");
-						set_tune_override(TONE_PARACHUTE_RELEASE_TUNE);
+						set_tune_override(tune_control_s::TUNE_ID_PARACHUTE_RELEASE);
 					}
 				}
 			}
@@ -2439,25 +2440,25 @@ Commander::run()
 		    (_safety.safety_switch_available || (_safety.safety_switch_available && _safety.safety_off))) {
 
 			/* play tune when armed */
-			set_tune(TONE_ARMING_WARNING_TUNE);
+			set_tune(tune_control_s::TUNE_ID_ARMING_WARNING);
 			_arm_tune_played = true;
 
 		} else if (!status_flags.usb_connected &&
 			   (status.hil_state != vehicle_status_s::HIL_STATE_ON) &&
 			   (_battery_warning == battery_status_s::BATTERY_WARNING_CRITICAL)) {
 			/* play tune on battery critical */
-			set_tune(TONE_BATTERY_WARNING_FAST_TUNE);
+			set_tune(tune_control_s::TUNE_ID_BATTERY_WARNING_FAST);
 
 		} else if ((status.hil_state != vehicle_status_s::HIL_STATE_ON) &&
 			   (_battery_warning == battery_status_s::BATTERY_WARNING_LOW)) {
 			/* play tune on battery warning */
-			set_tune(TONE_BATTERY_WARNING_SLOW_TUNE);
+			set_tune(tune_control_s::TUNE_ID_BATTERY_WARNING_SLOW);
 
 		} else if (status.failsafe) {
 			tune_failsafe(true);
 
 		} else {
-			set_tune(TONE_STOP_TUNE);
+			set_tune(tune_control_s::TUNE_ID_STOP);
 		}
 
 		/* reset arm_tune_played when disarmed */
@@ -2477,7 +2478,7 @@ Commander::run()
 		if (!sensor_fail_tune_played && (!status_flags.condition_system_sensors_initialized
 						 && status_flags.condition_system_hotplug_timeout)) {
 
-			set_tune_override(TONE_GPS_WARNING_TUNE);
+			set_tune_override(tune_control_s::TUNE_ID_GPS_WARNING);
 			sensor_fail_tune_played = true;
 			_status_changed = true;
 		}
@@ -2501,6 +2502,8 @@ Commander::run()
 		_status_changed = false;
 
 		arm_auth_update(now, params_updated || param_init_forced);
+
+		px4_indicate_external_reset_lockout(LockoutComponent::Commander, armed.armed);
 
 		px4_usleep(COMMANDER_MONITORING_INTERVAL);
 	}
@@ -2635,10 +2638,6 @@ Commander::control_status_leds(vehicle_status_s *status_local, const actuator_ar
 	}
 
 	_last_overload = overload;
-
-	/* board supports HW armed indicator */
-
-	BOARD_INDICATE_ARMED_STATE(actuator_armed->armed);
 
 #if !defined(CONFIG_ARCH_LEDS) && defined(BOARD_HAS_CONTROL_STATUS_LEDS)
 
@@ -3810,65 +3809,47 @@ void Commander::data_link_check()
 				}
 			}
 
-			for (const auto &hb : telemetry.heartbeats) {
-				// handle different remote types
-				switch (hb.type) {
-				case telemetry_heartbeat_s::TYPE_GCS:
+			if (telemetry.heartbeat_type_gcs) {
+				// Initial connection or recovery from data link lost
+				if (status.data_link_lost) {
+					status.data_link_lost = false;
+					_status_changed = true;
 
-					// Initial connection or recovery from data link lost
-					if (status.data_link_lost) {
-						if (hb.timestamp > _datalink_last_heartbeat_gcs) {
-							status.data_link_lost = false;
-							_status_changed = true;
-
-							if (!armed.armed && !status_flags.condition_calibration_enabled) {
-								// make sure to report preflight check failures to a connecting GCS
-								PreFlightCheck::preflightCheck(&mavlink_log_pub, status, status_flags,
-											       _arm_requirements.global_position, true, true, hrt_elapsed_time(&_boot_timestamp));
-							}
-
-							if (_datalink_last_heartbeat_gcs != 0) {
-								mavlink_log_info(&mavlink_log_pub, "Data link regained");
-							}
-						}
+					if (_datalink_last_heartbeat_gcs != 0) {
+						mavlink_log_info(&mavlink_log_pub, "Data link regained");
 					}
 
-					// Only keep the very last heartbeat timestamp, so we don't get confused
-					// by multiple mavlink instances publishing different timestamps.
-					if (hb.timestamp > _datalink_last_heartbeat_gcs) {
-						_datalink_last_heartbeat_gcs = hb.timestamp;
+					if (!armed.armed && !status_flags.condition_calibration_enabled) {
+						// make sure to report preflight check failures to a connecting GCS
+						PreFlightCheck::preflightCheck(&mavlink_log_pub, status, status_flags,
+									       _arm_requirements.global_position, true, true, hrt_elapsed_time(&_boot_timestamp));
 					}
-
-					break;
-
-				case telemetry_heartbeat_s::TYPE_ONBOARD_CONTROLLER:
-					if (_onboard_controller_lost) {
-						if (hb.timestamp > _datalink_last_heartbeat_onboard_controller) {
-							mavlink_log_info(&mavlink_log_pub, "Onboard controller regained");
-							_onboard_controller_lost = false;
-							_status_changed = true;
-						}
-					}
-
-					_datalink_last_heartbeat_onboard_controller = hb.timestamp;
-
-					if (hb.component_id == telemetry_heartbeat_s::COMP_ID_OBSTACLE_AVOIDANCE) {
-						if (hb.timestamp > _datalink_last_heartbeat_avoidance_system) {
-							_avoidance_system_status_change = (_datalink_last_status_avoidance_system != hb.state);
-						}
-
-						_datalink_last_heartbeat_avoidance_system = hb.timestamp;
-						_datalink_last_status_avoidance_system = hb.state;
-
-						if (_avoidance_system_lost) {
-							_status_changed = true;
-							_avoidance_system_lost = false;
-							status_flags.avoidance_system_valid = true;
-						}
-					}
-
-					break;
 				}
+
+				_datalink_last_heartbeat_gcs = telemetry.timestamp;
+			}
+
+			if (telemetry.heartbeat_type_onboard_controller) {
+				if (_onboard_controller_lost) {
+					_onboard_controller_lost = false;
+					_status_changed = true;
+
+					if (_datalink_last_heartbeat_onboard_controller != 0) {
+						mavlink_log_info(&mavlink_log_pub, "Onboard controller regained");
+					}
+				}
+
+				_datalink_last_heartbeat_onboard_controller = telemetry.timestamp;
+			}
+
+			if (telemetry.heartbeat_component_obstacle_avoidance) {
+				if (_avoidance_system_lost) {
+					_avoidance_system_lost = false;
+					_status_changed = true;
+				}
+
+				_datalink_last_heartbeat_avoidance_system = telemetry.timestamp;
+				status_flags.avoidance_system_valid = telemetry.avoidance_system_healthy;
 			}
 		}
 	}
@@ -3900,39 +3881,14 @@ void Commander::data_link_check()
 
 	// AVOIDANCE SYSTEM state check (only if it is enabled)
 	if (status_flags.avoidance_system_required && !_onboard_controller_lost) {
-
-		//if heartbeats stop
+		// if heartbeats stop
 		if (!_avoidance_system_lost && (_datalink_last_heartbeat_avoidance_system > 0)
 		    && (hrt_elapsed_time(&_datalink_last_heartbeat_avoidance_system) > 5_s)) {
 
 			_avoidance_system_lost = true;
 			status_flags.avoidance_system_valid = false;
 		}
-
-		//if status changed
-		if (_avoidance_system_status_change) {
-			if (_datalink_last_status_avoidance_system == telemetry_heartbeat_s::STATE_BOOT) {
-				status_flags.avoidance_system_valid = false;
-			}
-
-			if (_datalink_last_status_avoidance_system == telemetry_heartbeat_s::STATE_ACTIVE) {
-				status_flags.avoidance_system_valid = true;
-			}
-
-			if (_datalink_last_status_avoidance_system == telemetry_heartbeat_s::STATE_CRITICAL) {
-				status_flags.avoidance_system_valid = false;
-				_status_changed = true;
-			}
-
-			if (_datalink_last_status_avoidance_system == telemetry_heartbeat_s::STATE_FLIGHT_TERMINATION) {
-				status_flags.avoidance_system_valid = false;
-				_status_changed = true;
-			}
-
-			_avoidance_system_status_change = false;
-		}
 	}
-
 
 	// high latency data link loss failsafe
 	if (_high_latency_datalink_heartbeat > 0

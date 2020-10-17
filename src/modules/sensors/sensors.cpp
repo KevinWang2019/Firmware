@@ -117,10 +117,11 @@ private:
 
 	sensor_combined_s _sensor_combined{};
 
-	uORB::SubscriptionCallbackWorkItem _vehicle_imu_sub[3] {
+	uORB::SubscriptionCallbackWorkItem _vehicle_imu_sub[MAX_SENSOR_COUNT] {
 		{this, ORB_ID(vehicle_imu), 0},
 		{this, ORB_ID(vehicle_imu), 1},
-		{this, ORB_ID(vehicle_imu), 2}
+		{this, ORB_ID(vehicle_imu), 2},
+		{this, ORB_ID(vehicle_imu), 3}
 	};
 
 	uORB::Subscription _diff_pres_sub{ORB_ID(differential_pressure)};
@@ -175,7 +176,6 @@ private:
 	VehicleMagnetometer     *_vehicle_magnetometer{nullptr};
 	VehicleGPSPosition	*_vehicle_gps_position{nullptr};
 
-	static constexpr int MAX_SENSOR_COUNT = 3;
 	VehicleIMU      *_vehicle_imu_list[MAX_SENSOR_COUNT] {};
 
 
@@ -245,6 +245,7 @@ Sensors::Sensors(bool hil_enabled) :
 	param_find("SENS_BOARD_Y_OFF");
 	param_find("SENS_BOARD_Z_OFF");
 
+	param_find("SYS_FAC_CAL_MODE");
 	param_find("SYS_PARAM_VER");
 	param_find("SYS_AUTOSTART");
 	param_find("SYS_AUTOCONFIG");
@@ -388,8 +389,8 @@ void Sensors::diff_pres_poll()
 						  diff_pres.differential_pressure_filtered_pa, air_data.baro_pressure_pa,
 						  air_temperature_celsius);
 
-		airspeed.true_airspeed_m_s = calc_TAS_from_EAS(airspeed.indicated_airspeed_m_s, air_data.baro_pressure_pa,
-					     air_temperature_celsius); // assume that EAS = IAS as we don't have an EAS-scale here
+		airspeed.true_airspeed_m_s = calc_TAS_from_CAS(airspeed.indicated_airspeed_m_s, air_data.baro_pressure_pa,
+					     air_temperature_celsius); // assume that CAS = IAS as we don't have an CAS-scale here
 
 		airspeed.air_temperature_celsius = air_temperature_celsius;
 
