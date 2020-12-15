@@ -29,7 +29,7 @@ px4_add_board(
 		#imu/adis16497
 		#imu/bmi088
 		imu/mpu6000
-		#imu/invensense/icm20602
+		imu/invensense/icm20602
 		#imu/mpu9250
 		#irlock
 		lights/blinkm
@@ -90,6 +90,7 @@ px4_add_board(
 		hardfault_log
 		i2cdetect
 		led_control
+		#mft
 		mixer
 		#motor_ramp
 		motor_test

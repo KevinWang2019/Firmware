@@ -36,7 +36,7 @@ px4_add_board(
 		fw_pos_control_l1
 		land_detector
 		landing_target_estimator
-		#load_mon
+		load_mon
 		local_position_estimator
 		logger
 		mavlink
@@ -61,6 +61,7 @@ px4_add_board(
 		dyn
 		esc_calib
 		led_control
+		#mft
 		mixer
 		motor_ramp
 		motor_test
